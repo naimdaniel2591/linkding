@@ -218,11 +218,12 @@ Deletes a bookmark by ID.
 POST /api/bookmarks/<id>/preview-image/
 ```
 
-Uploads a custom preview image for a bookmark. Send a `multipart/form-data`
-request with a `file` field that contains the image to upload. The file must
-use one of the supported preview image extensions and stay within the configured
-maximum size (see the `LD_PREVIEW_ALLOWED_EXTENSIONS` and
-`LD_PREVIEW_MAX_SIZE` settings).
+Uploads a custom preview image for a bookmark. You can either send a
+`multipart/form-data` request with a `file` field that contains the image to
+upload or provide a JSON payload with an `image_url` that points to an external
+image. The uploaded file or downloaded image must use one of the supported
+preview image extensions and stay within the configured maximum size (see the
+`LD_PREVIEW_ALLOWED_EXTENSIONS` and `LD_PREVIEW_MAX_SIZE` settings).
 
 Example request using `curl`:
 
@@ -231,6 +232,17 @@ curl \
   -X POST \
   -H "Authorization: Token <Token>" \
   -F "file=@/path/to/preview.png" \
+  http://127.0.0.1:8000/api/bookmarks/1/preview-image/
+```
+
+Example request with an external URL:
+
+```
+curl \
+  -X POST \
+  -H "Authorization: Token <Token>" \
+  -H "Content-Type: application/json" \
+  -d '{"image_url": "https://example.com/preview.png"}' \
   http://127.0.0.1:8000/api/bookmarks/1/preview-image/
 ```
 

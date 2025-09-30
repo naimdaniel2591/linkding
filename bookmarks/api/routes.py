@@ -116,16 +116,25 @@ class BookmarkViewSet(
         bookmark = self.get_object()
 
         upload_file = request.FILES.get("file")
-        if not upload_file:
+        image_url = request.data.get("image_url")
+        if isinstance(image_url, str):
+            image_url = image_url.strip() or None
+
+        if not upload_file and not image_url:
             return Response(
-                {"error": "No file provided."},
+                {"error": "Either 'file' or 'image_url' must be provided."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
         try:
-            new_preview_image_file = preview_image_loader.save_uploaded_preview_image(
-                upload_file
-            )
+            if upload_file:
+                new_preview_image_file = (
+                    preview_image_loader.save_uploaded_preview_image(upload_file)
+                )
+            else:
+                new_preview_image_file = (
+                    preview_image_loader.save_preview_image_from_url(image_url)
+                )
         except preview_image_loader.PreviewImageUploadError as error:
             return Response(
                 {"error": str(error)},

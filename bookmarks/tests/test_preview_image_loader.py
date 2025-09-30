@@ -20,13 +20,16 @@ class MockStreamingResponse:
         content_type="image/png",
         content_length=None,
         status_code=200,
+        include_content_length=True,
     ):
         self.url = url
         self.chunks = [data]
         self.status_code = status_code
-        if not content_length:
+        if content_length is None:
             content_length = len(data)
-        self.headers = {"Content-Type": content_type, "Content-Length": content_length}
+        self.headers = {"Content-Type": content_type}
+        if include_content_length:
+            self.headers["Content-Length"] = content_length
 
     def iter_content(self, **kwargs):
         return self.chunks
@@ -65,11 +68,17 @@ class PreviewImageLoaderTestCase(TestCase):
         content_type="image/png",
         content_length=len(mock_image_data),
         status_code=200,
+        include_content_length=True,
     ):
         mock_response = mock.Mock()
         mock_response.raw = io.BytesIO(icon_data)
         return MockStreamingResponse(
-            url, icon_data, content_type, content_length, status_code
+            url,
+            icon_data,
+            content_type,
+            content_length,
+            status_code,
+            include_content_length,
         )
 
     def get_image_path(self, filename):
@@ -203,3 +212,74 @@ class PreviewImageLoaderTestCase(TestCase):
 
             self.assertImageExists(file, mock_image_data)
             self.assertEqual("jpg", file.split(".")[-1])
+
+    def test_save_preview_image_from_url(self):
+        with mock.patch("requests.get") as mock_get:
+            mock_get.return_value = self.create_mock_response()
+
+            file = preview_image_loader.save_preview_image_from_url(
+                "https://example.com/image.png"
+            )
+
+            self.assertTrue(file.endswith(".png"))
+            self.assertImageExists(file, mock_image_data)
+
+    def test_save_preview_image_from_url_requires_url(self):
+        with self.assertRaises(preview_image_loader.PreviewImageUploadError) as error:
+            preview_image_loader.save_preview_image_from_url("")
+
+        self.assertEqual(str(error.exception), "No image URL provided.")
+
+    def test_save_preview_image_from_url_rejects_invalid_status(self):
+        with mock.patch("requests.get") as mock_get:
+            mock_get.return_value = self.create_mock_response(status_code=400)
+
+            with self.assertRaises(preview_image_loader.PreviewImageUploadError) as error:
+                preview_image_loader.save_preview_image_from_url(
+                    "https://example.com/image.png"
+                )
+
+        self.assertEqual(str(error.exception), "Failed to download image.")
+        self.assertNoImageExists()
+
+    def test_save_preview_image_from_url_rejects_missing_content_length(self):
+        with mock.patch("requests.get") as mock_get:
+            mock_get.return_value = self.create_mock_response(
+                include_content_length=False
+            )
+
+            with self.assertRaises(preview_image_loader.PreviewImageUploadError) as error:
+                preview_image_loader.save_preview_image_from_url(
+                    "https://example.com/image.png"
+                )
+
+        self.assertEqual(str(error.exception), "Failed to download image.")
+        self.assertNoImageExists()
+
+    def test_save_preview_image_from_url_rejects_large_files(self):
+        with mock.patch("requests.get") as mock_get:
+            mock_get.return_value = self.create_mock_response(
+                content_length=settings.LD_PREVIEW_MAX_SIZE + 1
+            )
+
+            with self.assertRaises(preview_image_loader.PreviewImageUploadError) as error:
+                preview_image_loader.save_preview_image_from_url(
+                    "https://example.com/image.png"
+                )
+
+        self.assertEqual(str(error.exception), "File exceeds maximum size.")
+        self.assertNoImageExists()
+
+    def test_save_preview_image_from_url_rejects_invalid_content_type(self):
+        with mock.patch("requests.get") as mock_get:
+            mock_get.return_value = self.create_mock_response(
+                content_type="text/html"
+            )
+
+            with self.assertRaises(preview_image_loader.PreviewImageUploadError) as error:
+                preview_image_loader.save_preview_image_from_url(
+                    "https://example.com/image.png"
+                )
+
+        self.assertEqual(str(error.exception), "Unsupported file type.")
+        self.assertNoImageExists()

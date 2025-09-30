@@ -18,7 +18,7 @@ from rest_framework.response import Response
 
 import bookmarks.services.bookmarks
 from bookmarks.models import Bookmark, BookmarkSearch, UserProfile
-from bookmarks.services import website_loader
+from bookmarks.services import preview_image_loader, website_loader
 from bookmarks.services.wayback import generate_fallback_webarchive_url
 from bookmarks.services.website_loader import WebsiteMetadata
 from bookmarks.tests.helpers import LinkdingApiTestCase, BookmarkFactoryMixin
@@ -1333,7 +1333,48 @@ class BookmarksApiTestCase(LinkdingApiTestCase, BookmarkFactoryMixin):
         self.assertTrue(os.path.exists(new_path))
         self.assertFalse(os.path.exists(old_path))
 
-    def test_upload_preview_image_requires_file(self):
+    def test_upload_preview_image_from_url(self):
+        self.authenticate()
+        bookmark = self.setup_bookmark()
+        temp_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, temp_dir)
+
+        def save_image(url):
+            file_name = "external.png"
+            path = os.path.join(temp_dir, file_name)
+            with open(path, "wb") as file:
+                file.write(b"external")
+            return file_name
+
+        with override_settings(LD_PREVIEW_FOLDER=temp_dir):
+            with patch(
+                "bookmarks.services.preview_image_loader.save_preview_image_from_url",
+                side_effect=save_image,
+            ) as mock_save:
+                response = self.client.post(
+                    reverse(
+                        "linkding:bookmark-upload-preview-image", args=[bookmark.id]
+                    ),
+                    {"image_url": "https://example.com/image.png"},
+                    format="json",
+                )
+
+        mock_save.assert_called_once_with("https://example.com/image.png")
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(
+            response.data["message"], "Preview image uploaded successfully."
+        )
+        self.assertEqual(
+            response.data["preview_image_url"],
+            f"http://testserver/static/external.png",
+        )
+
+        bookmark.refresh_from_db()
+        self.assertEqual(bookmark.preview_image_file, "external.png")
+        self.assertTrue(os.path.exists(os.path.join(temp_dir, "external.png")))
+
+    def test_upload_preview_image_requires_file_or_url(self):
         self.authenticate()
         bookmark = self.setup_bookmark()
         temp_dir = tempfile.mkdtemp()
@@ -1347,7 +1388,33 @@ class BookmarksApiTestCase(LinkdingApiTestCase, BookmarkFactoryMixin):
             )
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertEqual(response.data["error"], "No file provided.")
+        self.assertEqual(
+            response.data["error"], "Either 'file' or 'image_url' must be provided."
+        )
+
+    def test_upload_preview_image_from_url_propagates_errors(self):
+        self.authenticate()
+        bookmark = self.setup_bookmark()
+        temp_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, temp_dir)
+
+        with override_settings(LD_PREVIEW_FOLDER=temp_dir):
+            with patch(
+                "bookmarks.services.preview_image_loader.save_preview_image_from_url",
+                side_effect=preview_image_loader.PreviewImageUploadError(
+                    "Failed to download image."
+                ),
+            ):
+                response = self.client.post(
+                    reverse(
+                        "linkding:bookmark-upload-preview-image", args=[bookmark.id]
+                    ),
+                    {"image_url": "https://example.com/image.png"},
+                    format="json",
+                )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.data["error"], "Failed to download image.")
 
     def test_upload_preview_image_rejects_large_files(self):
         self.authenticate()
