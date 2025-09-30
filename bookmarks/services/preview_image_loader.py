@@ -3,6 +3,7 @@ import logging
 import mimetypes
 import os.path
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 
 import requests
@@ -30,6 +31,117 @@ class PreviewImageUploadError(Exception):
     pass
 
 
+class PreviewImageDownloadError(Exception):
+    def __init__(
+        self,
+        code: str,
+        *,
+        error: Exception | None = None,
+        details: dict | None = None,
+    ):
+        super().__init__(code)
+        self.code = code
+        self.error = error
+        self.details = details or {}
+
+
+def _map_download_error_to_message(code: str) -> str:
+    if code == "content_length_exceeds_max":
+        return "File exceeds maximum size."
+    if code == "unsupported_content_type":
+        return "Unsupported file type."
+    return "Failed to download image."
+
+
+def _download_preview_image(
+    image_url: str,
+    file_name_generator: Callable[[str], str],
+    *,
+    log_message: str,
+) -> str:
+    _ensure_preview_folder()
+
+    try:
+        with requests.get(image_url, stream=True) as response:
+            if response.status_code < 200 or response.status_code >= 300:
+                raise PreviewImageDownloadError(
+                    "bad_status", details={"status_code": response.status_code}
+                )
+
+            content_length_header = response.headers.get("Content-Length")
+            if not content_length_header:
+                raise PreviewImageDownloadError("missing_content_length")
+
+            try:
+                content_length = int(content_length_header)
+            except (TypeError, ValueError):
+                raise PreviewImageDownloadError("missing_content_length")
+
+            if content_length > settings.LD_PREVIEW_MAX_SIZE:
+                raise PreviewImageDownloadError(
+                    "content_length_exceeds_max",
+                    details={"content_length": content_length},
+                )
+
+            content_type_header = response.headers.get("Content-Type")
+            if not content_type_header:
+                raise PreviewImageDownloadError("missing_content_type")
+
+            content_type = content_type_header.split(";", 1)[0]
+            file_extension = mimetypes.guess_extension(content_type)
+
+            if not file_extension or file_extension not in settings.LD_PREVIEW_ALLOWED_EXTENSIONS:
+                raise PreviewImageDownloadError(
+                    "unsupported_content_type",
+                    details={"content_type": content_type},
+                )
+
+            preview_image_file = file_name_generator(file_extension)
+            preview_image_path = _get_image_path(preview_image_file)
+
+            bytes_written = 0
+
+            try:
+                with open(preview_image_path, "wb") as file:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if not chunk:
+                            continue
+
+                        bytes_written += len(chunk)
+                        if bytes_written > settings.LD_PREVIEW_MAX_SIZE:
+                            raise PreviewImageDownloadError(
+                                "content_length_exceeds_max",
+                                details={"content_length": bytes_written},
+                            )
+                        if bytes_written > content_length:
+                            raise PreviewImageDownloadError(
+                                "content_length_mismatch",
+                                details={
+                                    "content_length": content_length,
+                                    "downloaded": bytes_written,
+                                },
+                            )
+
+                        file.write(chunk)
+            except PreviewImageDownloadError:
+                if preview_image_path.exists():
+                    preview_image_path.unlink()
+                raise
+            except Exception:
+                if preview_image_path.exists():
+                    preview_image_path.unlink()
+                raise
+
+    except PreviewImageDownloadError:
+        raise
+    except Exception as error:
+        raise PreviewImageDownloadError("request_error", error=error) from error
+
+    logger.debug(log_message.format(preview_image_path))
+
+    return preview_image_file
+
+
 def load_preview_image(url: str) -> str | None:
     _ensure_preview_folder()
 
@@ -41,58 +153,49 @@ def load_preview_image(url: str) -> str | None:
     image_url = metadata.preview_image
 
     logger.debug(f"Loading preview image: {image_url}")
-    with requests.get(image_url, stream=True) as response:
-        if response.status_code < 200 or response.status_code >= 300:
-            logger.debug(
-                f"Bad response status code for preview image: {image_url} status_code={response.status_code}"
-            )
-            return None
 
-        if "Content-Length" not in response.headers:
+    try:
+        return _download_preview_image(
+            image_url,
+            lambda extension: f"{_url_to_filename(url)}{extension}",
+            log_message="Saved preview image as: {}",
+        )
+    except PreviewImageDownloadError as error:
+        if error.code == "bad_status":
+            logger.debug(
+                "Bad response status code for preview image: %s status_code=%s",
+                image_url,
+                error.details.get("status_code"),
+            )
+        elif error.code == "missing_content_length":
             logger.debug(f"Empty Content-Length for preview image: {image_url}")
-            return None
-
-        content_length = int(response.headers["Content-Length"])
-        if content_length > settings.LD_PREVIEW_MAX_SIZE:
+        elif error.code == "content_length_exceeds_max":
             logger.debug(
-                f"Content-Length exceeds LD_PREVIEW_MAX_SIZE: {image_url} length={content_length}"
+                "Content-Length exceeds LD_PREVIEW_MAX_SIZE: %s length=%s",
+                image_url,
+                error.details.get("content_length"),
             )
-            return None
-
-        if "Content-Type" not in response.headers:
+        elif error.code == "missing_content_type":
             logger.debug(f"Empty Content-Type for preview image: {image_url}")
-            return None
-
-        content_type = response.headers["Content-Type"].split(";", 1)[0]
-        file_extension = mimetypes.guess_extension(content_type)
-
-        if file_extension not in settings.LD_PREVIEW_ALLOWED_EXTENSIONS:
+        elif error.code == "unsupported_content_type":
             logger.debug(
-                f"Unsupported Content-Type for preview image: {image_url} content_type={content_type}"
+                "Unsupported Content-Type for preview image: %s content_type=%s",
+                image_url,
+                error.details.get("content_type"),
             )
-            return None
-
-        preview_image_hash = _url_to_filename(url)
-        preview_image_file = f"{preview_image_hash}{file_extension}"
-        preview_image_path = _get_image_path(preview_image_file)
-
-        with open(preview_image_path, "wb") as file:
-            downloaded = 0
-            for chunk in response.iter_content(chunk_size=8192):
-                downloaded += len(chunk)
-                if downloaded > content_length:
-                    logger.debug(
-                        f"Content-Length mismatch for preview image: {image_url} length={content_length} downloaded={downloaded}"
-                    )
-                    file.close()
-                    preview_image_path.unlink()
-                    return None
-
-                file.write(chunk)
-
-    logger.debug(f"Saved preview image as: {preview_image_path}")
-
-    return preview_image_file
+        elif error.code == "content_length_mismatch":
+            logger.debug(
+                "Content-Length mismatch for preview image: %s length=%s downloaded=%s",
+                image_url,
+                error.details.get("content_length"),
+                error.details.get("downloaded"),
+            )
+        elif error.code == "request_error":
+            logger.debug(
+                f"Failed to download preview image: {image_url}",
+                exc_info=error.error,
+            )
+        return None
 
 
 def save_uploaded_preview_image(uploaded_file: UploadedFile) -> str:
@@ -130,3 +233,25 @@ def save_uploaded_preview_image(uploaded_file: UploadedFile) -> str:
     logger.debug(f"Saved uploaded preview image as: {preview_image_path}")
 
     return preview_image_file
+
+
+def save_preview_image_from_url(image_url: str) -> str:
+    if not image_url or not image_url.strip():
+        raise PreviewImageUploadError("No image URL provided.")
+
+    image_url = image_url.strip()
+
+    try:
+        return _download_preview_image(
+            image_url,
+            lambda extension: f"{uuid.uuid4().hex}{extension}",
+            log_message="Saved uploaded preview image as: {}",
+        )
+    except PreviewImageDownloadError as error:
+        message = _map_download_error_to_message(error.code)
+        if error.code == "request_error":
+            logger.debug(
+                f"Failed to download preview image: {image_url}",
+                exc_info=error.error,
+            )
+        raise PreviewImageUploadError(message)
